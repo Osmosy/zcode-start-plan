@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Запуск собранного ZCode CLI со Start Plan. Всегда 24-й node: в login-шелле PATH
+# может указывать на 22-й, а на нём TUI не работает.
+exec /usr/bin/node "${ZCODE_CLI_BUNDLE:-$HOME/zcode/apps/zcode-cli/packages/cli/dist/zcode.cjs}" "$@"

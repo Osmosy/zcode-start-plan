@@ -1,0 +1,375 @@
+diff --git a/apps/zcode-cli/packages/bootstrap/src/app/standalone-account-provider-runtime.ts b/apps/zcode-cli/packages/bootstrap/src/app/standalone-account-provider-runtime.ts
+index a99e7adb..c31c641f 100644
+--- a/apps/zcode-cli/packages/bootstrap/src/app/standalone-account-provider-runtime.ts
++++ b/apps/zcode-cli/packages/bootstrap/src/app/standalone-account-provider-runtime.ts
+@@ -19,14 +19,65 @@ import {
+   NodeZCodeBuiltinProviderConfigSource,
+   ZCODE_BUILTIN_PROVIDER_CONFIG_FILE_ENV,
+ } from "@zcode/provider-node";
+-import type { ProviderFamilyDomain } from "@zcode/shared";
++import {
++  normalizeOfficialGlmModelId,
++  resolveRuntimeZCodeEndpointOrigin,
++  ZCODE_VERSION,
++  type ProviderFamilyDomain,
++} from "@zcode/shared";
+ 
+ export interface StandaloneCodingPlanProvider {
+   readonly family: ProviderFamilyDomain;
++  // Local patch: Start Plan (zai only) is served by the standalone CLI as well.
++  readonly mode: "individual-coding-plan" | "start-plan";
+   readonly modelId: string;
+   readonly providerId: string;
+ }
+ 
++const START_PLAN_BALANCE_TIMEOUT_MS = 15_000;
++
++/** Start Plan model whitelist from billing/balance, as the desktop host does; undefined if unknown. */
++async function fetchStandaloneStartPlanModelIds(
++  jwt: string,
++  env: Readonly<Record<string, string | undefined>>,
++): Promise<readonly string[] | undefined> {
++  try {
++    const url = new URL(
++      `${resolveRuntimeZCodeEndpointOrigin(env)}/api/v1/zcode-plan/billing/balance`,
++    );
++    // A dev build reports 0.0.0-dev, which billing/balance rejects; allow the installed app version.
++    url.searchParams.set("app_version", env.ZCODE_STANDALONE_APP_VERSION?.trim() || ZCODE_VERSION);
++    const response = await fetch(url, {
++      headers: { Authorization: `Bearer ${jwt}` },
++      signal: AbortSignal.timeout(START_PLAN_BALANCE_TIMEOUT_MS),
++    });
++    const payload = (await response.json().catch(() => ({}))) as {
++      code?: number;
++      msg?: string;
++      data?: { balances?: Array<{ capabilities?: string[]; show_name?: string }> };
++    };
++    if (env.ZCODE_DEBUG_START_PLAN)
++      console.warn("[start-plan-debug] balance", response.status, payload.code, payload.msg,
++        (payload.data?.balances ?? []).map((b) => [b.show_name, b.capabilities]));
++    if (!response.ok) return undefined;
++    const modelIds = new Map<string, string>();
++    for (const balance of payload.data?.balances ?? []) {
++      const fromCapabilities = (balance.capabilities ?? [])
++        .map((capability) => capability.trim())
++        .filter((capability) => capability.toLowerCase().startsWith("model:"))
++        .map((capability) => capability.slice("model:".length).trim());
++      for (const candidate of fromCapabilities.length ? fromCapabilities : [balance.show_name ?? ""]) {
++        const modelId = normalizeOfficialGlmModelId(candidate.trim());
++        if (modelId && !modelIds.has(modelId.toLowerCase())) modelIds.set(modelId.toLowerCase(), modelId);
++      }
++    }
++    return modelIds.size ? [...modelIds.values()] : undefined;
++  } catch (error) {
++    if (env.ZCODE_DEBUG_START_PLAN) console.warn("[start-plan-debug] balance error", String(error));
++    return undefined;
++  }
++}
++
+ export async function readStandaloneCodingPlanProviders(
+   env: Readonly<Record<string, string | undefined>>,
+ ): Promise<readonly StandaloneCodingPlanProvider[]> {
+@@ -43,15 +94,15 @@ async function readStandaloneCodingPlanCatalog(
+   if (config)
+     return {
+       zcodeBuiltinRevision: config.revision,
+-      providers: config.providers.entries().flatMap(([providerId, provider]) => {
++      providers: config.providers.entries().flatMap(([providerId, provider]): StandaloneCodingPlanProvider[] => {
+         const access = provider.access;
+         const modelId = provider.builtinModelIds?.find((candidate) => candidate.trim())?.trim();
+-        return access?.type === "zhipu-account" &&
+-          access.mode === "individual-coding-plan" &&
+-          access.accountType &&
+-          modelId
+-          ? [{ family: access.accountType, modelId, providerId }]
+-          : [];
++        if (access?.type !== "zhipu-account" || !access.accountType || !modelId) return [];
++        if (access.mode === "individual-coding-plan")
++          return [{ family: access.accountType, mode: access.mode, modelId, providerId }];
++        if (access.mode === "start-plan" && access.accountType === "zai")
++          return [{ family: access.accountType, mode: access.mode, modelId, providerId }];
++        return [];
+       }),
+     };
+   const filePath = env[ZCODE_BUILTIN_PROVIDER_CONFIG_FILE_ENV]?.trim();
+@@ -75,7 +126,7 @@ export async function resolveStandaloneCodingPlanProvider(
+   env: Readonly<Record<string, string | undefined>>,
+ ): Promise<StandaloneCodingPlanProvider> {
+   const matches = (await readStandaloneCodingPlanProviders(env)).filter(
+-    (provider) => provider.family === family,
++    (provider) => provider.family === family && provider.mode === "individual-coding-plan",
+   );
+   if (matches.length !== 1) {
+     throw new Error(
+@@ -125,7 +176,29 @@ export async function readStandaloneAccountProviderConfigSnapshot(
+   config?: Pick<ProviderConfigLayerSnapshot, "revision" | "providers">,
+ ): Promise<AccountProviderConfigSnapshot> {
+   const catalog = await readStandaloneCodingPlanCatalog(env, config);
+-  const configuredProviders = catalog.providers;
++  const configuredProviders = catalog.providers.filter(
++    ({ mode }) => mode === "individual-coding-plan",
++  );
++  const startPlanProviders = catalog.providers.filter(({ mode }) => mode === "start-plan");
++  const zcodeJwt = startPlanProviders.length
++    ? (await credentialStore.loadMany([SHARED_ZCODE_CREDENTIAL_KEYS.zcodeJwtToken]))[
++        SHARED_ZCODE_CREDENTIAL_KEYS.zcodeJwtToken
++      ]?.trim()
++    : undefined;
++  const modelOverride = env.ZCODE_STANDALONE_START_PLAN_MODELS?.split(",")
++    .map((modelId) => normalizeOfficialGlmModelId(modelId.trim()))
++    .filter(Boolean);
++  const startPlanModelIds = modelOverride?.length
++    ? modelOverride
++    : zcodeJwt
++      ? await fetchStandaloneStartPlanModelIds(zcodeJwt, env)
++      : undefined;
++  if (env.ZCODE_DEBUG_START_PLAN)
++    console.warn("[start-plan-debug]", {
++      catalog: catalog.providers.map(({ providerId, mode }) => `${providerId}:${mode}`),
++      jwtPresent: Boolean(zcodeJwt),
++      startPlanModelIds,
++    });
+   const identityKeys = configuredProviders.map(({ providerId }) =>
+     standaloneAccountIdentityCredentialKey(providerId),
+   );
+@@ -153,8 +226,19 @@ export async function readStandaloneAccountProviderConfigSnapshot(
+   const candidateByProviderId = new Map(
+     candidates.map((candidate) => [candidate.providerId, candidate]),
+   );
+-  const providers = new ProviderConfigMap(
+-    configuredProviders.map(({ family, providerId }) => {
++  const startPlanEntries = startPlanProviders.map(
++    ({ providerId }) =>
++      [
++        providerId,
++        new ProviderConfig({
++          access: new ZhipuAccountAccessConfig({ entitled: Boolean(zcodeJwt) }),
++          ...(startPlanModelIds ? { builtinModelIds: startPlanModelIds } : {}),
++        }),
++      ] as const,
++  );
++  const providers = new ProviderConfigMap([
++    ...startPlanEntries,
++    ...configuredProviders.map(({ family, providerId }) => {
+       const candidate = candidateByProviderId.get(providerId);
+       const source = sources[standaloneAccountAuthSourceCredentialKey(providerId)];
+       const requestCredentialKey =
+@@ -177,7 +261,7 @@ export async function readStandaloneAccountProviderConfigSnapshot(
+         }),
+       ] as const;
+     }),
+-  );
++  ]);
+   return createAccountProviderConfigSnapshot(catalog.zcodeBuiltinRevision, providers);
+ }
+ 
+@@ -234,6 +318,13 @@ export function createStandaloneProviderRuntimeHeadersPort(
+       input.abortSignal?.throwIfAborted();
+       const providerId = input.providerId.trim();
+       const access = input.accountAccess;
++      if (access?.mode === "start-plan" && access.accountType === "zai") {
++        // Same request credential as the desktop host: the ZCode JWT saved by `zcode login zai`.
++        const jwt = (await credentialStore.load(SHARED_ZCODE_CREDENTIAL_KEYS.zcodeJwtToken))?.trim();
++        if (!jwt) throw new Error("project_token_login_required");
++        input.abortSignal?.throwIfAborted();
++        return { headersApplied: true, requestAuth: { apiKey: jwt } };
++      }
+       if (!access || access.mode !== "individual-coding-plan") {
+         throw new Error(`Standalone Account Provider 请求身份无效: ${providerId}`);
+       }
+diff --git a/apps/zcode-cli/packages/bootstrap/tests/standalone-start-plan.test.ts b/apps/zcode-cli/packages/bootstrap/tests/standalone-start-plan.test.ts
+new file mode 100644
+index 00000000..c2ea5ba5
+--- /dev/null
++++ b/apps/zcode-cli/packages/bootstrap/tests/standalone-start-plan.test.ts
+@@ -0,0 +1,143 @@
++import { ProviderConfig, ProviderConfigMap, ZhipuAccountAccessConfig } from "@zcode/provider";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import {
++  createStandaloneProviderRuntimeHeadersPort,
++  readStandaloneAccountProviderConfigSnapshot,
++} from "../src/app/standalone-account-provider-runtime.js";
++
++// Local patch: Start Plan in the standalone CLI.
++const START_PLAN = "account:zai-start-plan";
++const BIGMODEL_START_PLAN = "account:bigmodel-start-plan";
++const JWT_KEY = "zcodejwttoken";
++
++function store(values: Record<string, string>) {
++  return {
++    load: async (key: string) => values[key] ?? null,
++    loadMany: async (keys: readonly string[]) =>
++      Object.fromEntries(keys.map((key) => [key, values[key] ?? null])),
++    save: vi.fn(async () => {}),
++    delete: vi.fn(async () => {}),
++  };
++}
++
++const builtin = {
++  revision: "builtin",
++  providers: new ProviderConfigMap([
++    [
++      START_PLAN,
++      new ProviderConfig({
++        access: new ZhipuAccountAccessConfig({ accountType: "zai", mode: "start-plan" }),
++        builtinModelIds: ["GLM-5.3-Flash", "GLM-5.2"],
++      }),
++    ],
++    [
++      BIGMODEL_START_PLAN,
++      new ProviderConfig({
++        access: new ZhipuAccountAccessConfig({ accountType: "bigmodel", mode: "start-plan" }),
++        builtinModelIds: ["GLM-5.3-Flash"],
++      }),
++    ],
++  ]),
++};
++
++function request(port: ReturnType<typeof createStandaloneProviderRuntimeHeadersPort>) {
++  return port.refreshBeforeModelRequest({
++    providerId: START_PLAN,
++    modelId: "GLM-5.3",
++    accountAccess: { type: "zhipu-account", accountType: "zai", entitled: true, mode: "start-plan" },
++    reason: "model-request",
++    sessionId: "session" as never,
++    traceContext: { traceId: "trace" } as never,
++  });
++}
++
++afterEach(() => {
++  vi.restoreAllMocks();
++});
++
++describe("Standalone Start Plan", () => {
++  it("is entitled with the ZCode JWT and takes its models from the environment, without a balance call", async () => {
++    const fetch = vi.spyOn(globalThis, "fetch");
++    const snapshot = await readStandaloneAccountProviderConfigSnapshot(
++      store({ [JWT_KEY]: "jwt-a" }),
++      { ZCODE_STANDALONE_START_PLAN_MODELS: "glm-5.3, GLM-5.3-Flash" },
++      builtin,
++    );
++    const provider = snapshot.providers.get(START_PLAN);
++    expect(provider?.access).toMatchObject({ entitled: true });
++    expect(provider?.builtinModelIds).toEqual(["GLM-5.3", "GLM-5.3-Flash"]);
++    expect(fetch).not.toHaveBeenCalled();
++  });
++
++  it("takes the model whitelist from billing/balance capabilities", async () => {
++    const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(
++      new Response(
++        JSON.stringify({
++          code: 200,
++          data: {
++            balances: [
++              { show_name: "GLM-5.3", capabilities: ["model:GLM-5.3"] },
++              { show_name: "GLM-5.3-Flash", capabilities: [] },
++              { show_name: "duplicate", capabilities: ["model:glm-5.3"] },
++            ],
++          },
++        }),
++        { status: 200 },
++      ),
++    );
++    const snapshot = await readStandaloneAccountProviderConfigSnapshot(
++      store({ [JWT_KEY]: "jwt-a" }),
++      {},
++      builtin,
++    );
++    expect(snapshot.providers.get(START_PLAN)?.builtinModelIds).toEqual(["GLM-5.3", "GLM-5.3-Flash"]);
++    const [url, init] = fetch.mock.calls[0]!;
++    expect(String(url)).toContain("/api/v1/zcode-plan/billing/balance");
++    expect((init?.headers as Record<string, string>).Authorization).toBe("Bearer jwt-a");
++  });
++
++  it("keeps the built-in models when billing/balance fails", async () => {
++    vi.spyOn(globalThis, "fetch").mockResolvedValue(
++      new Response(JSON.stringify({ code: 3001, msg: "parameter error" }), { status: 400 }),
++    );
++    const snapshot = await readStandaloneAccountProviderConfigSnapshot(
++      store({ [JWT_KEY]: "jwt-a" }),
++      {},
++      builtin,
++    );
++    const provider = snapshot.providers.get(START_PLAN);
++    expect(provider?.access).toMatchObject({ entitled: true });
++    expect(provider?.builtinModelIds).toBeUndefined();
++  });
++
++  it("is not entitled without the ZCode JWT, and BigModel Start Plan stays out", async () => {
++    const fetch = vi.spyOn(globalThis, "fetch");
++    const snapshot = await readStandaloneAccountProviderConfigSnapshot(store({}), {}, builtin);
++    expect(snapshot.providers.get(START_PLAN)?.access).toMatchObject({ entitled: false });
++    expect(snapshot.providers.get(BIGMODEL_START_PLAN)).toBeUndefined();
++    expect(fetch).not.toHaveBeenCalled();
++  });
++
++  it("authorises a Start Plan request with the ZCode JWT and no project token", async () => {
++    const resolver = { resolve: vi.fn(), resolveMaterial: vi.fn(), clear: vi.fn() };
++    const port = createStandaloneProviderRuntimeHeadersPort(
++      store({ [JWT_KEY]: "jwt-a" }),
++      {},
++      resolver as never,
++    );
++    await expect(request(port)).resolves.toEqual({
++      headersApplied: true,
++      requestAuth: { apiKey: "jwt-a" },
++    });
++    expect(resolver.resolveMaterial).not.toHaveBeenCalled();
++  });
++
++  it("asks for a login when the ZCode JWT is missing", async () => {
++    const port = createStandaloneProviderRuntimeHeadersPort(store({}), {}, {
++      resolve: vi.fn(),
++      resolveMaterial: vi.fn(),
++      clear: vi.fn(),
++    } as never);
++    await expect(request(port)).rejects.toThrow("project_token_login_required");
++  });
++});
+diff --git a/packages/provider/src/model-selection-config.ts b/packages/provider/src/model-selection-config.ts
+index 6da5cfe1..7fb9e0d9 100644
+--- a/packages/provider/src/model-selection-config.ts
++++ b/packages/provider/src/model-selection-config.ts
+@@ -32,10 +32,17 @@ export function resolveInitialModelSelection(input: {
+   // 这里只构造 Host 的初始推荐，不解析已有会话意图。失效默认是可丢弃偏好，
+   // 应继续按 Registry 顺序推荐；不能把历史选择留空的规则误用于新草稿初始化。
+   if (input.configuredDefault) {
+-    if (isSelectable(input.registry, input.configuredDefault)) {
++    // Local patch: `zcode login` saves {providerId, modelId} without options; complete such a default
++    // instead of dropping it. A default with an invalid level is still dropped, as upstream intends.
++    const selection = isSelectable(input.registry, input.configuredDefault)
++      ? input.configuredDefault
++      : input.configuredDefault.options?.reasoningLevel === undefined
++        ? completeNewModelSelection(input.registry, input.configuredDefault)
++        : undefined;
++    if (selection && isSelectable(input.registry, selection)) {
+       return {
+         source: "configured-default",
+-        selection: freezeSelection(input.configuredDefault),
++        selection: freezeSelection(selection),
+       };
+     }
+   }
+diff --git a/packages/provider/test/model-selection-config.test.ts b/packages/provider/test/model-selection-config.test.ts
+index c543e3fe..a9a0250a 100644
+--- a/packages/provider/test/model-selection-config.test.ts
++++ b/packages/provider/test/model-selection-config.test.ts
+@@ -82,6 +82,18 @@ describe("resolveInitialModelSelection", () => {
+     });
+   });
+ 
++  it("completes a default saved without options (as zcode login writes it) instead of dropping it", () => {
++    expect(
++      resolveInitialModelSelection({
++        configuredDefault: { providerId: "provider-b", modelId: "model-b" },
++        registry,
++      }),
++    ).toMatchObject({
++      source: "configured-default",
++      selection: { providerId: "provider-b", modelId: "model-b" },
++    });
++  });
++
+   it("reports an empty registry without inventing a model", () => {
+     expect(
+       resolveInitialModelSelection({

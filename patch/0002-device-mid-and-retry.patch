@@ -1,0 +1,266 @@
+diff --git a/apps/zcode-cli/packages/bootstrap/src/app/standalone-account-provider-runtime.ts b/apps/zcode-cli/packages/bootstrap/src/app/standalone-account-provider-runtime.ts
+index a99e7adb..d75526b5 100644
+--- a/apps/zcode-cli/packages/bootstrap/src/app/standalone-account-provider-runtime.ts
++++ b/apps/zcode-cli/packages/bootstrap/src/app/standalone-account-provider-runtime.ts
+@@ -1,4 +1,7 @@
+ import { createHash } from "node:crypto";
++import { readFileSync } from "node:fs";
++import { homedir } from "node:os";
++import { join } from "node:path";
+ import {
+   createCodingPlanApiKeyResolver,
+   SHARED_ZCODE_CREDENTIAL_KEYS,
+@@ -19,14 +22,97 @@ import {
+   NodeZCodeBuiltinProviderConfigSource,
+   ZCODE_BUILTIN_PROVIDER_CONFIG_FILE_ENV,
+ } from "@zcode/provider-node";
+-import type { ProviderFamilyDomain } from "@zcode/shared";
++import {
++  normalizeOfficialGlmModelId,
++  resolveRuntimeZCodeEndpointOrigin,
++  ZCODE_VERSION,
++  type ProviderFamilyDomain,
++} from "@zcode/shared";
+ 
+ export interface StandaloneCodingPlanProvider {
+   readonly family: ProviderFamilyDomain;
++  // Local patch: Start Plan (zai only) is served by the standalone CLI as well.
++  readonly mode: "individual-coding-plan" | "start-plan";
+   readonly modelId: string;
+   readonly providerId: string;
+ }
+ 
++const START_PLAN_BALANCE_TIMEOUT_MS = 15_000;
++
++/** billing/balance отвечает 400 parameter error без device_mid — берём id устройства приложения. */
++function resolveStartPlanDeviceMid(
++  env: Readonly<Record<string, string | undefined>>,
++): string | undefined {
++  const fromEnv = env.ZCODE_DEVICE_MID?.trim();
++  if (fromEnv) return fromEnv;
++  try {
++    const baseDir = env.ZCODE_DATA_BASE_DIR?.trim() || join(homedir(), ".zcode");
++    const parsed = JSON.parse(
++      readFileSync(join(baseDir, "v2", "telemetry-state.json"), "utf8"),
++    ) as { deviceMid?: string };
++    return parsed.deviceMid?.trim() || undefined;
++  } catch {
++    return undefined;
++  }
++}
++
++/** Start Plan model whitelist from billing/balance, as the desktop host does; undefined if unknown. */
++async function fetchStandaloneStartPlanModelIds(
++  jwt: string,
++  env: Readonly<Record<string, string | undefined>>,
++): Promise<readonly string[] | undefined> {
++  try {
++    const url = new URL(
++      `${resolveRuntimeZCodeEndpointOrigin(env)}/api/v1/zcode-plan/billing/balance`,
++    );
++    // A dev build reports 0.0.0-dev, which billing/balance rejects; allow the installed app version.
++    url.searchParams.set("app_version", env.ZCODE_STANDALONE_APP_VERSION?.trim() || ZCODE_VERSION);
++    const deviceMid = resolveStartPlanDeviceMid(env);
++    if (deviceMid) url.searchParams.set("device_mid", deviceMid);
++    // Эндпоинт периодически отдаёт 400/таймаут — пробуем несколько раз, иначе Start Plan не включится.
++    let response: Response | undefined;
++    for (let attempt = 1; attempt <= 3; attempt += 1) {
++      try {
++        response = await fetch(url, {
++          headers: { Authorization: `Bearer ${jwt}` },
++          signal: AbortSignal.timeout(START_PLAN_BALANCE_TIMEOUT_MS),
++        });
++        if (response.ok) break;
++      } catch (error) {
++        if (env.ZCODE_DEBUG_START_PLAN)
++          console.warn("[start-plan-debug] balance attempt", attempt, String(error));
++        response = undefined;
++      }
++      if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 1_500));
++    }
++    if (!response) return undefined;
++    const payload = (await response.json().catch(() => ({}))) as {
++      code?: number;
++      msg?: string;
++      data?: { balances?: Array<{ capabilities?: string[]; show_name?: string }> };
++    };
++    if (env.ZCODE_DEBUG_START_PLAN)
++      console.warn("[start-plan-debug] balance", response.status, payload.code, payload.msg,
++        (payload.data?.balances ?? []).map((b) => [b.show_name, b.capabilities]));
++    if (!response.ok) return undefined;
++    const modelIds = new Map<string, string>();
++    for (const balance of payload.data?.balances ?? []) {
++      const fromCapabilities = (balance.capabilities ?? [])
++        .map((capability) => capability.trim())
++        .filter((capability) => capability.toLowerCase().startsWith("model:"))
++        .map((capability) => capability.slice("model:".length).trim());
++      for (const candidate of fromCapabilities.length ? fromCapabilities : [balance.show_name ?? ""]) {
++        const modelId = normalizeOfficialGlmModelId(candidate.trim());
++        if (modelId && !modelIds.has(modelId.toLowerCase())) modelIds.set(modelId.toLowerCase(), modelId);
++      }
++    }
++    return modelIds.size ? [...modelIds.values()] : undefined;
++  } catch (error) {
++    if (env.ZCODE_DEBUG_START_PLAN) console.warn("[start-plan-debug] balance error", String(error));
++    return undefined;
++  }
++}
++
+ export async function readStandaloneCodingPlanProviders(
+   env: Readonly<Record<string, string | undefined>>,
+ ): Promise<readonly StandaloneCodingPlanProvider[]> {
+@@ -43,15 +129,15 @@ async function readStandaloneCodingPlanCatalog(
+   if (config)
+     return {
+       zcodeBuiltinRevision: config.revision,
+-      providers: config.providers.entries().flatMap(([providerId, provider]) => {
++      providers: config.providers.entries().flatMap(([providerId, provider]): StandaloneCodingPlanProvider[] => {
+         const access = provider.access;
+         const modelId = provider.builtinModelIds?.find((candidate) => candidate.trim())?.trim();
+-        return access?.type === "zhipu-account" &&
+-          access.mode === "individual-coding-plan" &&
+-          access.accountType &&
+-          modelId
+-          ? [{ family: access.accountType, modelId, providerId }]
+-          : [];
++        if (access?.type !== "zhipu-account" || !access.accountType || !modelId) return [];
++        if (access.mode === "individual-coding-plan")
++          return [{ family: access.accountType, mode: access.mode, modelId, providerId }];
++        if (access.mode === "start-plan" && access.accountType === "zai")
++          return [{ family: access.accountType, mode: access.mode, modelId, providerId }];
++        return [];
+       }),
+     };
+   const filePath = env[ZCODE_BUILTIN_PROVIDER_CONFIG_FILE_ENV]?.trim();
+@@ -75,7 +161,7 @@ export async function resolveStandaloneCodingPlanProvider(
+   env: Readonly<Record<string, string | undefined>>,
+ ): Promise<StandaloneCodingPlanProvider> {
+   const matches = (await readStandaloneCodingPlanProviders(env)).filter(
+-    (provider) => provider.family === family,
++    (provider) => provider.family === family && provider.mode === "individual-coding-plan",
+   );
+   if (matches.length !== 1) {
+     throw new Error(
+@@ -125,7 +211,29 @@ export async function readStandaloneAccountProviderConfigSnapshot(
+   config?: Pick<ProviderConfigLayerSnapshot, "revision" | "providers">,
+ ): Promise<AccountProviderConfigSnapshot> {
+   const catalog = await readStandaloneCodingPlanCatalog(env, config);
+-  const configuredProviders = catalog.providers;
++  const configuredProviders = catalog.providers.filter(
++    ({ mode }) => mode === "individual-coding-plan",
++  );
++  const startPlanProviders = catalog.providers.filter(({ mode }) => mode === "start-plan");
++  const zcodeJwt = startPlanProviders.length
++    ? (await credentialStore.loadMany([SHARED_ZCODE_CREDENTIAL_KEYS.zcodeJwtToken]))[
++        SHARED_ZCODE_CREDENTIAL_KEYS.zcodeJwtToken
++      ]?.trim()
++    : undefined;
++  const modelOverride = env.ZCODE_STANDALONE_START_PLAN_MODELS?.split(",")
++    .map((modelId) => normalizeOfficialGlmModelId(modelId.trim()))
++    .filter(Boolean);
++  const startPlanModelIds = modelOverride?.length
++    ? modelOverride
++    : zcodeJwt
++      ? await fetchStandaloneStartPlanModelIds(zcodeJwt, env)
++      : undefined;
++  if (env.ZCODE_DEBUG_START_PLAN)
++    console.warn("[start-plan-debug]", {
++      catalog: catalog.providers.map(({ providerId, mode }) => `${providerId}:${mode}`),
++      jwtPresent: Boolean(zcodeJwt),
++      startPlanModelIds,
++    });
+   const identityKeys = configuredProviders.map(({ providerId }) =>
+     standaloneAccountIdentityCredentialKey(providerId),
+   );
+@@ -153,8 +261,19 @@ export async function readStandaloneAccountProviderConfigSnapshot(
+   const candidateByProviderId = new Map(
+     candidates.map((candidate) => [candidate.providerId, candidate]),
+   );
+-  const providers = new ProviderConfigMap(
+-    configuredProviders.map(({ family, providerId }) => {
++  const startPlanEntries = startPlanProviders.map(
++    ({ providerId }) =>
++      [
++        providerId,
++        new ProviderConfig({
++          access: new ZhipuAccountAccessConfig({ entitled: Boolean(zcodeJwt) }),
++          ...(startPlanModelIds ? { builtinModelIds: startPlanModelIds } : {}),
++        }),
++      ] as const,
++  );
++  const providers = new ProviderConfigMap([
++    ...startPlanEntries,
++    ...configuredProviders.map(({ family, providerId }) => {
+       const candidate = candidateByProviderId.get(providerId);
+       const source = sources[standaloneAccountAuthSourceCredentialKey(providerId)];
+       const requestCredentialKey =
+@@ -177,7 +296,7 @@ export async function readStandaloneAccountProviderConfigSnapshot(
+         }),
+       ] as const;
+     }),
+-  );
++  ]);
+   return createAccountProviderConfigSnapshot(catalog.zcodeBuiltinRevision, providers);
+ }
+ 
+@@ -234,6 +353,13 @@ export function createStandaloneProviderRuntimeHeadersPort(
+       input.abortSignal?.throwIfAborted();
+       const providerId = input.providerId.trim();
+       const access = input.accountAccess;
++      if (access?.mode === "start-plan" && access.accountType === "zai") {
++        // Same request credential as the desktop host: the ZCode JWT saved by `zcode login zai`.
++        const jwt = (await credentialStore.load(SHARED_ZCODE_CREDENTIAL_KEYS.zcodeJwtToken))?.trim();
++        if (!jwt) throw new Error("project_token_login_required");
++        input.abortSignal?.throwIfAborted();
++        return { headersApplied: true, requestAuth: { apiKey: jwt } };
++      }
+       if (!access || access.mode !== "individual-coding-plan") {
+         throw new Error(`Standalone Account Provider 请求身份无效: ${providerId}`);
+       }
+diff --git a/packages/provider/src/model-selection-config.ts b/packages/provider/src/model-selection-config.ts
+index 6da5cfe1..7fb9e0d9 100644
+--- a/packages/provider/src/model-selection-config.ts
++++ b/packages/provider/src/model-selection-config.ts
+@@ -32,10 +32,17 @@ export function resolveInitialModelSelection(input: {
+   // 这里只构造 Host 的初始推荐，不解析已有会话意图。失效默认是可丢弃偏好，
+   // 应继续按 Registry 顺序推荐；不能把历史选择留空的规则误用于新草稿初始化。
+   if (input.configuredDefault) {
+-    if (isSelectable(input.registry, input.configuredDefault)) {
++    // Local patch: `zcode login` saves {providerId, modelId} without options; complete such a default
++    // instead of dropping it. A default with an invalid level is still dropped, as upstream intends.
++    const selection = isSelectable(input.registry, input.configuredDefault)
++      ? input.configuredDefault
++      : input.configuredDefault.options?.reasoningLevel === undefined
++        ? completeNewModelSelection(input.registry, input.configuredDefault)
++        : undefined;
++    if (selection && isSelectable(input.registry, selection)) {
+       return {
+         source: "configured-default",
+-        selection: freezeSelection(input.configuredDefault),
++        selection: freezeSelection(selection),
+       };
+     }
+   }
+diff --git a/packages/provider/test/model-selection-config.test.ts b/packages/provider/test/model-selection-config.test.ts
+index c543e3fe..a9a0250a 100644
+--- a/packages/provider/test/model-selection-config.test.ts
++++ b/packages/provider/test/model-selection-config.test.ts
+@@ -82,6 +82,18 @@ describe("resolveInitialModelSelection", () => {
+     });
+   });
+ 
++  it("completes a default saved without options (as zcode login writes it) instead of dropping it", () => {
++    expect(
++      resolveInitialModelSelection({
++        configuredDefault: { providerId: "provider-b", modelId: "model-b" },
++        registry,
++      }),
++    ).toMatchObject({
++      source: "configured-default",
++      selection: { providerId: "provider-b", modelId: "model-b" },
++    });
++  });
++
+   it("reports an empty registry without inventing a model", () => {
+     expect(
+       resolveInitialModelSelection({
