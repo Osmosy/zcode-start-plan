@@ -38,7 +38,10 @@ try {
   process.exit(1);
 }
 
-const prev = cfg.defaultModelSelection ?? null;
+// Реальный ключ лежит в обёртке config (schemaVersion 1); на верхнем уровне
+// его нет, поэтому пишем туда, где он уже есть, с откатом на корень.
+const container = cfg.config && typeof cfg.config === "object" ? cfg.config : cfg;
+const prev = container.defaultModelSelection ?? null;
 const next = clear
   ? null
   : {
@@ -63,8 +66,8 @@ if (JSON.stringify(prev) === JSON.stringify(next)) {
 
 const bak = `${cfgPath}.bak-${new Date().toISOString().slice(0, 10)}`;
 fs.writeFileSync(bak, raw);
-if (next === null) delete cfg.defaultModelSelection;
-else cfg.defaultModelSelection = next;
+if (next === null) delete container.defaultModelSelection;
+else container.defaultModelSelection = next;
 fs.writeFileSync(cfgPath, `${JSON.stringify(cfg, null, 2)}\n`);
 console.log('бэкап :', bak);
 console.log('записано');
