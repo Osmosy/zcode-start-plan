@@ -67,6 +67,8 @@ docs/howto.md                        пошагово: сборка, логин,
 docs/promo.md                        что раздают, сроки, наблюдённые остатки
 scripts/build.sh                     сборка одной командой
 scripts/zcode-start-plan             обёртка запуска (всегда node 24)
+scripts/zcode-acp                    ACP-обёртка для T3 Code / Zed (симлинк в ~/.local/bin)
+acp/zcode_acp.py                     сам ACP-агент: JSON-RPC по stdio → zcode-start-plan --json
 scripts/check-balance.py             читает used_units из billing/balance
 ```
 
@@ -92,6 +94,45 @@ python3 scripts/check-balance.py
 ```
 
 Экран подписки в приложении — не доказательство: он показывает процент дневной квоты.
+
+## Start Plan в ACP-оболочках (T3 Code, Zed)
+
+Патченный CLI умеет `--prompt … --json`, но ACP не говорит. Поэтому в репозитории лежит
+тонкий ACP-агент `acp/zcode_acp.py`: JSON-RPC 2.0 построчно через stdio, на каждый
+`session/prompt` запускает `scripts/zcode-start-plan --prompt … --json --cwd …` и отдаёт текст
+нотификацией `agent_message_chunk`. Диалог держится на `--resume <sess_…>`, который агент
+запоминает из ответа CLI.
+
+Это дополняет обёртку Z.ai из ACP-реестра (`stefandevo/glm-acp-agent`): та собрана только под
+Coding Plan (`/api/coding/paas/v4`), про Start Plan не знает, и подставить туда наш провайдер
+нельзя.
+
+```bash
+# 1. поставить лаунчер в PATH (T3 Code принимает только имя команды, путь отклоняет)
+ln -sf "$PWD/scripts/zcode-acp" ~/.local/bin/zcode-acp
+
+# 2. проверить без клиента
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"'"$PWD"'","mcpServers":[]}}' \
+  | zcode-acp
+
+# 3. в T3 Code: Settings → Providers → Add provider → Show more → Local ACP command
+#    executable = zcode-acp, дальше Label и Add instance
+```
+
+Что важно знать до запуска:
+
+- агент обязан объявить модели в `session/new` — без каталога провайдер виден как Available, но
+  в пикере не выбирается;
+- после правки агента сервер клиента надо перезапустить: возможности кэшируются на рукопожатии;
+- клиентские MCP-серверы (`mcpServers` из `session/new`) не прокидываются, поэтому агент внутри
+  такой оболочки не вызывает `delegate_task` и не порождает кросс-харнессовых субагентов;
+- каждый ход — отдельный процесс CLI, то есть платный; контекст между ходами держится только
+  через `--resume`.
+
+Проверено на T3 Code 0.1.6: провайдер «ZCode Start Plan» в статусе Available, тред отвечает по
+существу (`7*6 → 42`), а вопрос «процитируй моё первое сообщение» возвращает его дословно.
 
 ## Предупреждения
 

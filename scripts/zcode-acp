@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# ACP-обёртка над Start Plan для ACP-клиентов (T3 Code, Zed, …).
+# Ставится симлинком в ~/.local/bin: ln -sf "$PWD/scripts/zcode-acp" ~/.local/bin/zcode-acp
+# Клиент требует имя команды из PATH, а не путь.
+self="$0"
+[ -L "$self" ] && self="$(readlink -f "$self")"
+root="$(cd "$(dirname "$self")/.." && pwd)"
+exec python3 "$root/acp/zcode_acp.py" "$@"
